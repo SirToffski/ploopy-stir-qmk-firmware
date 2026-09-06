@@ -1,0 +1,214 @@
+/* Copyright 2023 Colin Lam (Ploopy Corporation)
+ * Copyright 2020 Christopher Courtney, aka Drashna Jael're  (@drashna) <drashna@live.com>
+ * Copyright 2019 Sunjun Kim
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include QMK_KEYBOARD_H
+#include <math.h>
+
+#ifndef M_PI
+#    define M_PI 3.14159265358979323846f
+#endif
+
+/* NOTE: VIA exports layers in matrix order (col0..col5), NOT LAYOUT order.
+ * LAYOUT order here is [col1, col2, col3, col4, col0, col5], so the stock
+ * VIA export [BTN1, BTN4, BTN5, DRAG, BTN2, BTN3] maps to:
+ *   LAYOUT(BTN4, BTN5, DRAG, BTN2, BTN1, BTN3). */
+const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
+    [0] = LAYOUT( MS_BTN4, MS_BTN5, DRAG_SCROLL, MS_BTN2, MS_BTN1, MS_BTN3 ),
+    [1] = LAYOUT( _______, _______, _______, _______, _______, _______ ),
+    [2] = LAYOUT( _______, _______, _______, _______, _______, _______ ),
+    [3] = LAYOUT( _______, _______, _______, _______, _______, _______ ),
+    [4] = LAYOUT( _______, _______, _______, _______, _______, _______ ),
+    [5] = LAYOUT( _______, _______, _______, _______, _______, _______ ),
+    [6] = LAYOUT( _______, _______, _______, _______, _______, _______ ),
+    [7] = LAYOUT( _______, _______, _______, _______, _______, _______ )
+};
+
+/* Stir-to-scroll prototype (via keymap only, default untouched).
+ *
+ * UX: a small closed-loop "stir" ARMS scroll mode (either direction -- CW vs
+ * CCW no longer matters). Once armed, plain up/down ball motion scrolls;
+ * the cursor stays put. Scroll mode disarms after STIR_SCROLL_IDLE_MS with
+ * no ball input, and the next touch is a cursor again. No button needed.
+ *
+ * Detection: per-report signed turning totals. Back-and-forth scrub cancels
+ * to ~zero and never arms; steady looping builds to STIR_ENTER_ANGLE with a
+ * small mean radius (path / |angle|). Deliberately no circle-purity test:
+ * real gestures are ~2:1 ellipses whose flat sides barely turn per unit
+ * travel, so straight-run/corner rejection goes deaf mid-orbit.
+ *
+ * Tune via `qmk console` (CONSOLE_ENABLE in rules.mk). Angle logs are
+ * milliradians (5000 = 5.0 rad).
+ */
+
+// Arming gates (stroke totals, signed angle so scrub cancels out).
+#define STIR_ENTER_ANGLE 5.0f
+#define STIR_MAX_RADIUS_ENTER 392.0f
+#define STIR_MIN_PATH 60.0f
+// Scroll-mode feel. THE timeout: no ball input for this long disarms scroll.
+#define STIR_SCROLL_IDLE_MS 600
+// Ball travel per wheel notch (same units/scale as PLOOPY_DRAGSCROLL_DIVISOR).
+#define STIR_SCROLL_DIVISOR 8.0f
+// Ball-up scrolls up by default; set true if it feels backwards.
+#define STIR_SCROLL_INVERT false
+// Per-report motion below this magnitude is treated as noise/idle.
+#define STIR_NOISE_FLOOR 2.0f
+// Gap of no motion that ends a non-scroll stroke.
+#define STIR_STROKE_GAP_MS 250
+// Cooldown after disarming before a new stroke may arm.
+#define STIR_EXIT_COOLDOWN_MS 200
+
+// NOTE: is_drag_scroll lives in keyboards/ploopyco/ploopyco.c (non-static).
+// If upstream ever makes it static this extern fails at link time -- then
+// track DRAG_SCROLL toggles locally in process_record_user instead.
+extern bool is_drag_scroll;
+
+static float    stir_angle       = 0.0f; // stroke signed turning (arming gate)
+static float    stir_path        = 0.0f; // stroke travel
+static float    stir_scroll_frac = 0.0f; // fractional scroll accumulator
+static int16_t  stir_prev_dx     = 0;
+static int16_t  stir_prev_dy     = 0;
+static bool     stir_have_prev   = false;
+static bool     stir_active      = false;
+static uint16_t stir_last_motion = 0;
+static uint16_t stir_last_exit   = 0;
+static bool     stir_timer_init  = false;
+
+static void stir_reset_stroke(void) {
+    stir_angle = 0.0f;
+    stir_path  = 0.0f;
+    stir_have_prev = false;
+}
+
+// Drain whole scroll units into the report.
+static void stir_emit_scroll(report_mouse_t *report) {
+    int16_t v_out = (int16_t)stir_scroll_frac;
+    if (v_out > 127) v_out = 127;
+    if (v_out < -127) v_out = -127;
+    stir_scroll_frac -= v_out;
+    report->v = (int8_t)CONSTRAIN_HID((int16_t)report->v + v_out);
+    report->x = 0;
+    report->y = 0;
+    report->h = 0;
+}
+
+report_mouse_t pointing_device_task_user(report_mouse_t mouse_report) {
+    int16_t  dx  = mouse_report.x;
+    int16_t  dy  = mouse_report.y;
+    uint16_t now = timer_read();
+
+    if (!stir_timer_init) {
+        stir_last_motion = now;
+        stir_last_exit   = now;
+        stir_timer_init  = true;
+    }
+
+    // Never fight button drags/selects or the stock drag-scroll toggle.
+    if (is_drag_scroll || mouse_report.buttons != 0) {
+        if (stir_active) {
+            stir_active    = false;
+            stir_last_exit = now;
+        }
+        stir_reset_stroke();
+        stir_scroll_frac = 0.0f;
+        stir_last_motion = now;
+        return mouse_report;
+    }
+
+    float mag = sqrtf((float)dx * dx + (float)dy * dy);
+
+    if (mag < STIR_NOISE_FLOOR) {
+        if (stir_active) {
+            if (timer_elapsed(stir_last_motion) > STIR_SCROLL_IDLE_MS) {
+                stir_active    = false;
+                stir_last_exit = now;
+#ifdef CONSOLE_ENABLE
+                uprintf("stir: exit idle\n");
+#endif
+                stir_reset_stroke();
+                stir_scroll_frac = 0.0f;
+            }
+        } else if (timer_elapsed(stir_last_motion) > STIR_STROKE_GAP_MS) {
+#ifdef CONSOLE_ENABLE
+            if (stir_path > 15.0f) {
+                // A stroke just ended without arming: log it for tuning.
+                float a = fabsf(stir_angle);
+                float r = (a > 0.3f) ? (stir_path / a) : 9999.0f;
+                uprintf("stir: stroke angle=%d path=%d r=%d (need |angle|>%d, path>%d, r<%d)\n", (int)(stir_angle * 1000), (int)stir_path, (int)r, (int)(STIR_ENTER_ANGLE * 1000), (int)STIR_MIN_PATH, (int)STIR_MAX_RADIUS_ENTER);
+            }
+#endif
+            stir_reset_stroke();
+        }
+        return mouse_report;
+    }
+
+    // New stroke after a pause (timeout depends on mode).
+    uint16_t gap_limit = stir_active ? STIR_SCROLL_IDLE_MS : STIR_STROKE_GAP_MS;
+    if (timer_elapsed(stir_last_motion) > gap_limit) {
+        if (stir_active) {
+            stir_active    = false;
+            stir_last_exit = now;
+        }
+        stir_reset_stroke();
+        stir_scroll_frac = 0.0f;
+    }
+    stir_last_motion = now;
+
+    if (stir_active) {
+        // Scroll mode: Y motion scrolls, everything else is suppressed.
+        // Any input (even pure X) keeps the mode alive; only a full
+        // STIR_SCROLL_IDLE_MS of stillness disarms.
+        float y_contrib = (STIR_SCROLL_INVERT ? (float)dy : -(float)dy) / STIR_SCROLL_DIVISOR;
+        stir_scroll_frac += y_contrib;
+        stir_emit_scroll(&mouse_report);
+        stir_prev_dx   = dx;
+        stir_prev_dy   = dy;
+        stir_have_prev = true;
+        return mouse_report;
+    }
+
+    if (stir_have_prev) {
+        float dot    = (float)stir_prev_dx * dx + (float)stir_prev_dy * dy;
+        float cross  = (float)stir_prev_dx * dy - (float)stir_prev_dy * dx;
+        float dtheta = atan2f(cross, dot); // + = one direction, - = the other
+
+        stir_angle += dtheta;
+        stir_path += mag;
+
+        float abs_angle = fabsf(stir_angle);
+        float r_est     = (abs_angle > 0.3f) ? (stir_path / abs_angle) : 9999.0f;
+        bool  cooled    = timer_elapsed(stir_last_exit) > STIR_EXIT_COOLDOWN_MS;
+        if (cooled && abs_angle > STIR_ENTER_ANGLE && stir_path > STIR_MIN_PATH && r_est < STIR_MAX_RADIUS_ENTER) {
+            stir_active      = true;
+            stir_scroll_frac = 0.0f;
+#ifdef CONSOLE_ENABLE
+            uprintf("stir: enter angle=%d path=%d r=%d\n", (int)(stir_angle * 1000), (int)stir_path, (int)r_est);
+#endif
+            float y_contrib = (STIR_SCROLL_INVERT ? (float)dy : -(float)dy) / STIR_SCROLL_DIVISOR;
+            stir_scroll_frac += y_contrib;
+            stir_emit_scroll(&mouse_report);
+            stir_prev_dx   = dx;
+            stir_prev_dy   = dy;
+            stir_have_prev = true;
+            return mouse_report;
+        }
+    }
+
+    stir_prev_dx   = dx;
+    stir_prev_dy   = dy;
+    stir_have_prev = true;
+    return mouse_report;
+}
