@@ -62,7 +62,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 /* ---- scroll-mode feel ---- */
 #define STIR_SCROLL_IDLE_MS    600     // stillness before disarming
 #define STIR_SCROLL_DIVISOR    4.0f    // matches PLOOPY_DRAGSCROLL_DIVISOR_V
-#define STIR_SCROLL_INVERT     false   // flip if it opposes button drag-scroll
+#define STIR_SCROLL_INVERT     true   // flip if it opposes button drag-scroll
 
 /* ---- input conditioning ---- */
 #define STIR_NOISE_FLOOR       2.0f
