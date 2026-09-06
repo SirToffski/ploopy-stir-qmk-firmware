@@ -69,4 +69,4 @@ All knobs are `#define`s at the top of
 ## Building & flashing
 
 ```sh
-qmk compile -kb ploopyco/madromys/rev1_001 -km via
+qmk compile -kb keyboards/ploopyco/madromys/rev1_001 -km via
